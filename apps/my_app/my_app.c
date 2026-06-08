@@ -12,16 +12,21 @@ static void changed(lv_event_t *e) {
 
     hb_brightness_set_percent(value);
 
-    lv_label_set_text_fmt(label,"%d%%", value);
+    lv_label_set_text_fmt(label,"%d%%", hb_brightness_get_percent());
 
 
 }
 static void button_clicked(lv_event_t *e) {
- hb_brightness_set_percent(1);
+ hb_brightness_set_percent(-10);
+     lv_label_set_text_fmt(label,"%d%%", hb_brightness_get_percent());
+
+ 
     
 }
 static void button_clicked2(lv_event_t *e) {
  hb_brightness_set_percent(100);
+     lv_label_set_text_fmt(label,"%d%%", hb_brightness_get_percent());
+
     
 }
 HB_APP_ENTRY(payload_entry) {
