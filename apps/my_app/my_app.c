@@ -17,7 +17,7 @@ static void changed(lv_event_t *e) {
 
 }
 static void button_clicked(lv_event_t *e) {
- hb_brightness_set_percent(-10);
+ hb_brightness_set_percent(-100);
      lv_label_set_text_fmt(label,"%d%%", hb_settings_get_brightness());
 
  
