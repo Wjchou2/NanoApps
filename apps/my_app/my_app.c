@@ -1,7 +1,7 @@
 #include "hb_sdk.h"
 #include "lvgl.h"
 #include <stdio.h>
-
+lv_obj_t *label;
 static void changed(lv_event_t *e) {
     lv_obj_t *label = lv_event_get_user_data(e);
     lv_obj_t *slider = lv_event_get_target(e);
@@ -40,7 +40,7 @@ HB_APP_ENTRY(payload_entry) {
 
     lv_slider_set_range(slider, 0, 100);
 
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    label = lv_label_create(lv_screen_active());
 
     lv_obj_set_width(label, 180);
     lv_obj_align(label, LV_ALIGN_CENTER, 60, 50);
