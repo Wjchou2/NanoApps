@@ -8,7 +8,6 @@ static void changed(lv_event_t *e) {
     int value = lv_slider_get_value(slider);
     hb_brightness_set(value);
     char text[16];
-    snprintf(text, sizeof(text), "%d", value);
     lv_label_set_text(label, text);
 
 
