@@ -820,11 +820,11 @@ sudo mkdir -p {mnt}
 mounted=
 for i in $(seq 1 6); do
   sudo umount {mnt} 2>/dev/null || true
-  if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+if sudo mount -t hfsplus -o rw {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
     sudo rm -f {mnt}/.hbrw; mounted=1; break
   fi
   sudo umount {mnt} 2>/dev/null || true
-  sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true
+  # sudo fsck.vfat -a -w {part} >/dev/null 2>&1 || true
   sleep 1
 done
 [ -n "$mounted" ] || {{ echo 'could not mount the iPod read-write (FAT may be corrupt) - run: ./start fsck' >&2; exit 1; }}
@@ -839,7 +839,7 @@ def _install_disk(tr, src, data, data_force):
     tr.stage(f"{src}/Apps", f"{stage}/Apps")
     if (data or data_force) and (ROOT / "data").is_dir():
         tr.stage(str(ROOT / "data"), f"{stage}/data")
-    dev = tr.dev(); part = dev + "1"
+    dev = tr.dev(); part = dev + "2"
     mnt = os.environ.get("IPOD_MOUNT", "/mnt/nanoapps-ipod")
     force = "1" if data_force else ""
     copy = f"""# Replace the app payload but PRESERVE {mnt}/Apps/Data, and sweep retired layouts
@@ -1079,7 +1079,7 @@ udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || tru
 sudo fsck.vfat -a -w -v {part} 2>&1 | tail -20 || sudo fsck.vfat -a -w {part} || true
 echo '--- verifying read-write mount ---'
 sudo mkdir -p {mnt}
-if sudo mount -o rw,flush {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
+if sudo mount -t hfsplus -o rw {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
   sudo rm -f {mnt}/.hbrw; sudo umount {mnt}; echo 'OK: the iPod filesystem is healthy and writable'
 else
   sudo umount {mnt} 2>/dev/null || true
