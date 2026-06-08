@@ -1,5 +1,6 @@
 #include "hb_sdk.h"
 #include "lvgl.h"
+#include <stdio.h>
 
 static void changed(lv_event_t *e) {
     lv_obj_t *label = lv_event_get_user_data(e);
