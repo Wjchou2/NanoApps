@@ -10,9 +10,9 @@ static void changed(lv_event_t *e) {
     int brightness = value * 255 / 100;
     brightness = hb_brightness_get();
 
-    hb_brightness_set(brightness);
+    // hb_brightness_set(brightness);
 
-    lv_label_set_text_fmt(label,"%d", value);
+    lv_label_set_text_fmt(label,"%d", brightness);
 
 
 }
