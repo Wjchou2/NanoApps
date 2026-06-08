@@ -7,7 +7,7 @@ static void changed(lv_event_t *e) {
     lv_obj_t *slider = lv_event_get_target(e);
     
     int value = lv_slider_get_value(slider);
-    int brightness = value * 49152 / 100;
+    int brightness = (49152-(value * 49152 ))/100;
     // brightness = hb_brightness_get();
 
     hb_brightness_set(brightness);
