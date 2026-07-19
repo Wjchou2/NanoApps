@@ -928,16 +928,27 @@ udisksctl unmount -b {part} 2>/dev/null || sudo umount {part} 2>/dev/null || tru
 {repair}
 sudo mkdir -p {mnt}
 mounted=
+mount_log=$(mktemp /tmp/nanoapps-mount.XXXXXX)
 for i in $(seq 1 6); do
   sudo umount {mnt} 2>/dev/null || true
-  if sudo mount -t {fstype} -o {mount_options} {part} {mnt} 2>/dev/null && sudo touch {mnt}/.hbrw 2>/dev/null; then
-    sudo rm -f {mnt}/.hbrw; mounted=1; break
+  : >"$mount_log"
+  if sudo mount -t {fstype} -o {mount_options} {part} {mnt} 2>"$mount_log"; then
+    if sudo touch {mnt}/.hbrw 2>>"$mount_log"; then
+      sudo rm -f {mnt}/.hbrw; mounted=1; break
+    fi
+    echo 'volume mounted, but the write test was rejected' >>"$mount_log"
   fi
   sudo umount {mnt} 2>/dev/null || true
   {repair}
   sleep 1
 done
-[ -n "$mounted" ] || {{ echo 'could not mount the iPod {label} volume read-write ({hint})' >&2; exit 1; }}
+if [ -z "$mounted" ]; then
+  cat "$mount_log" >&2
+  rm -f "$mount_log"
+  echo 'could not mount the iPod {label} volume read-write ({hint})' >&2
+  exit 1
+fi
+rm -f "$mount_log"
 """
 
 
@@ -980,7 +991,10 @@ echo "/Apps/Executables: $(ls {mnt}/Apps/Executables | wc -l | tr -d ' ')"
 [ -d {mnt}/Apps/Data ] && echo "/Apps/Data folders: $(ls {mnt}/Apps/Data | wc -l | tr -d ' ')"
 sudo umount {mnt}
 echo 'apps installed to disk'"""
-    tr.sh(_mount_prep(dev, part, fstype, mnt) + copy)
+    try:
+        tr.sh(_mount_prep(dev, part, fstype, mnt) + copy)
+    except subprocess.CalledProcessError:
+        sys.exit("install stopped before the app payload was written")
 
 
 # ---- full app deploy ---------------------------------------------------------
