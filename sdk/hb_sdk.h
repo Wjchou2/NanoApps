@@ -199,6 +199,14 @@ bool hb_fs_stream_open(const char *path);
 bool hb_fs_stream_write(const void *data, uint32_t len);
 bool hb_fs_stream_close(void);
 
+/* Streaming reader: open one file and consume it sequentially without loading
+   the whole file into RAM. Only one streaming reader/writer may be live at a
+   time. hb_fs_read_stream() returns the bytes actually read; a short read is
+   EOF or an I/O error. */
+bool     hb_fs_read_stream_open(const char *path);
+uint32_t hb_fs_read_stream(void *buf, uint32_t len);
+bool     hb_fs_read_stream_close(void);
+
 /* Read up to `max_size` bytes from `path` into `buf`. Returns the
    number of bytes actually read (0 if file is missing or read failed). */
 uint32_t hb_fs_read(const char *path, void *buf, uint32_t max_size);

@@ -563,6 +563,13 @@ static void hb_nav_backswipe_set(int enabled)
  * memory is reclaimed. */
 static void hb_surface_teardown(void)
 {
+    /* Give a relocatable LVGL app a final callback while its code/BSS arena is
+     * still valid. Apps use this to close persistent file handles and release
+     * OS-heap allocations; op=1 is a no-op for older runtimes. */
+    if (s_surface_reloc_entry) {
+        typedef void *(*surface_entry_t)(int op, void *fb, int w, int h);
+        ((surface_entry_t)s_surface_reloc_entry)(1, s_fb, FB_W, FB_H);
+    }
     /* Restore the OS edge-swipe-to-go-back our surface suppressed (once, on quit).
      * Safe here now that the disable is asserted on EVERY launch (templ_hook, incl.
      * the cached-view reuse path): a edge-swipe-back can never START inside a surface app,
@@ -583,6 +590,7 @@ static void hb_surface_teardown(void)
     hb_surface_drain_pending();
     s_pending_free_arena = s_surface_arena;
     s_surface_arena = 0;
+    s_surface_reloc_entry = 0;
     s_cur_app_id = 0;
 }
 

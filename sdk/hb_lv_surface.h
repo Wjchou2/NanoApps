@@ -29,6 +29,11 @@ void hb_lv_set_frame_cb(void (*cb)(void));
  * ON TOP of LVGL (e.g. a hardware overlay via hb_compositor). Pass 0 to clear. */
 void hb_lv_set_post_cb(void (*cb)(void));
 
+/* Optional teardown hook. The resident calls the surface entry with op=1 while
+ * the app arena is still alive, giving apps that own OS resources (open files,
+ * heap blocks, wake locks) a chance to release them on a Home/app transition. */
+void hb_lv_set_exit_cb(void (*cb)(void));
+
 /* The display framebuffer (LVGL renders directly into it; XRGB8888, w*h*4,
  * GPU-addressable). For an app frame cb that wants hardware 2D (hb_compositor). */
 void *hb_lv_framebuffer(void);

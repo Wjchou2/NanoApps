@@ -145,9 +145,12 @@ bool hb_fs_write_parts(const char *path, void *const *ptrs,
 #define STREAM_CACHE_ADDR 0x0911a200u
 static fobj_t s_stream;
 static bool   s_stream_live;
+static fobj_t s_read_stream;
+static bool   s_read_stream_live;
 
 bool hb_fs_stream_open(const char *path)
 {
+    if (s_read_stream_live) hb_fs_read_stream_close();
     if (s_stream_live) hb_fs_stream_close();
     if (!fobj_begin(&s_stream, (void *)STREAM_OBJ_ADDR,
                     (uint8_t *)STREAM_CACHE_ADDR, path, true))
@@ -167,6 +170,46 @@ bool hb_fs_stream_close(void)
     if (!s_stream_live) return false;
     fobj_finish(&s_stream);
     s_stream_live = false;
+    return true;
+}
+
+/* ---- streaming reader: shares the persistent object/cache with the writer.
+   The OS file object advances its cursor after each FOBJ_READ, letting large
+   media be consumed frame-by-frame without an app-sized allocation. ---- */
+
+bool hb_fs_read_stream_open(const char *path)
+{
+    if (s_stream_live) hb_fs_stream_close();
+    if (s_read_stream_live) hb_fs_read_stream_close();
+    if (!fobj_begin(&s_read_stream, (void *)STREAM_OBJ_ADDR,
+                    (uint8_t *)STREAM_CACHE_ADDR, path, false))
+        return false;
+    s_read_stream_live = true;
+    return true;
+}
+
+uint32_t hb_fs_read_stream(void *data, uint32_t len)
+{
+    uint8_t *p = (uint8_t *)data;
+    uint32_t total = 0;
+    if (!s_read_stream_live) return 0;
+    while (len) {
+        uint32_t chunk = len > FS_WRITE_CHUNK ? FS_WRITE_CHUNK : len;
+        uint32_t got = 0;
+        int rc = FOBJ_READ(s_read_stream.obj, chunk, p, &got);
+        total += got;
+        p += got;
+        len -= got;
+        if (rc != 0 || got != chunk) break;
+    }
+    return total;
+}
+
+bool hb_fs_read_stream_close(void)
+{
+    if (!s_read_stream_live) return false;
+    FOBJ_CLOSE(s_read_stream.obj);
+    s_read_stream_live = false;
     return true;
 }
 

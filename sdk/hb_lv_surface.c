@@ -77,6 +77,11 @@ void hb_lv_set_frame_cb(void (*cb)(void)) { hb_lv_app_frame_cb = cb; }
 void (*hb_lv_app_post_cb)(void);
 void hb_lv_set_post_cb(void (*cb)(void)) { hb_lv_app_post_cb = cb; }
 
+/* Optional cleanup callback, invoked through payload_entry(op=1) before the
+   resident retires this app's relocatable arena. */
+static void (*hb_lv_app_exit_cb)(void);
+void hb_lv_set_exit_cb(void (*cb)(void)) { hb_lv_app_exit_cb = cb; }
+
 /* ---- display wake lock ----
  * Keep the panel lit while a touch-less app runs (benchmark, slideshow, clock,
  * now-playing). The native idle/dim-permission path can't gate us — the OS's
@@ -211,6 +216,10 @@ void *payload_entry(int op, void *fb, int w, int h)
     extern unsigned int __bss_start__[], __bss_end__[];
     unsigned int *p;
 
+    if (op == 1) {
+        if (hb_lv_app_exit_cb) hb_lv_app_exit_cb();
+        return 0;
+    }
     if (op != 0)
         return 0;
 #ifndef HB_LV_RELOC
