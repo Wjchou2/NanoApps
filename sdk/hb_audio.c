@@ -46,17 +46,18 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc,
 typedef int   (*pthread_create_t)(uint32_t *thread, void *attr,
                                   void *(*start)(void *), void *arg);
 
-/* Per-call state — static because the pthread must outlive the
-   spawn site, and the descriptor must outlive playback. Single-shot
-   only; a concurrent call clobbers the in-flight sound. */
+/* Per-call state — static because the pthread must outlive the spawn site,
+   and the descriptor must remain intact while the OS consumes the sound. */
 typedef struct {
-    char     path[96];
+    char     path[192];
     int      volume_id;
     uint32_t play_volume;
     uint8_t  desc[0x78];
 } audio_job_t;
 
-static audio_job_t g_job;
+#define AUDIO_JOB_SLOTS 4
+static audio_job_t g_jobs[AUDIO_JOB_SLOTS];
+static uint32_t g_next_job;
 
 /* Attribute block for the audio worker thread; the same for every spawn. */
 static uint32_t g_attr[16] = {
@@ -98,13 +99,19 @@ static void copy_path(char *dst, const char *src, int max)
 static bool play_wav_at_volume(const char *path, int volume_id,
                                uint32_t play_volume)
 {
-    copy_path(g_job.path, path, (int)sizeof(g_job.path));
-    g_job.volume_id   = volume_id;
-    g_job.play_volume = play_volume;
+    /* Keep several descriptors alive so a short, just-finished sound is not
+       overwritten as the next one is queued.  This is especially useful for
+       the Video Player's one-second WAV chunks and avoids an app-owned
+       completion callback that could fire after the app has been unloaded. */
+    audio_job_t *job = &g_jobs[g_next_job];
+    g_next_job = (g_next_job + 1u) % AUDIO_JOB_SLOTS;
+    copy_path(job->path, path, (int)sizeof(job->path));
+    job->volume_id   = volume_id;
+    job->play_volume = play_volume;
 
     uint32_t tid = 0;
     int rc = ((pthread_create_t)PTHREAD_CREATE_ADDR)(
-        &tid, g_attr, audio_worker, &g_job);
+        &tid, g_attr, audio_worker, job);
     return rc == 0;
 }
 

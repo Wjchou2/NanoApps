@@ -280,8 +280,9 @@ bool hb_fs_set_attr(const char *path, uint8_t attr_byte);
    return from your app entry, or block on a long sleep. A tight UI
    loop after this call will STARVE the pthread and no sound plays.
 
-   Single-shot only: the descriptor is a static buffer. Don't call
-   again until the previous sound has finished.
+   A small descriptor ring keeps recently queued sounds alive. Avoid starting
+   more than four overlapping sounds; the OS does not expose a proven stop or
+   pause entry point here.
 
    Known WAV paths on the iPod resource volume:
        Resources/Sounds/shake.wav        (shake-to-shuffle sound)

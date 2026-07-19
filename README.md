@@ -18,8 +18,9 @@ Everything else should work the same, using this repo.
 
 ## Video Player
 
-The Video Player app plays streamed, silent `.hbv` files from
-`/Apps/Data/Videos`. Convert MP4/MOV/etc. on the host with FFmpeg:
+The Video Player app plays streamed `.hbv` files from `/Apps/Data/Videos`,
+with audio when the converter finds a soundtrack. Convert MP4/MOV/etc. on the
+host with FFmpeg:
 
 ```sh
 tools/make_hbv.py input.mp4 data/Videos/MyVideo.hbv
@@ -27,6 +28,12 @@ tools/make_hbv.py input.mp4 data/Videos/MyVideo.hbv
 
 The default is letterboxed 240x320 video at 12 fps. You can change the rate up
 to 30 fps with `--fps`, trading file size and decode load for smoother motion.
-Install/copy the resulting `.hbv` file to the iPod's
-`/Apps/Data/Videos` directory. Audio is not yet supported because the current
-homebrew SDK has no synchronized streaming-audio API.
+The converter also creates `MyVideo.audio/` beside `MyVideo.hbv`; copy both to
+the iPod's `/Apps/Data/Videos` directory. Audio is mono, 22.05 kHz PCM split
+into one-second WAV chunks so it can stream through the firmware's sound-effect
+player. Use `--no-audio` for a silent conversion.
+
+The firmware does not expose a proven stop/seek call for these WAVs. Pause,
+restart, loop, and leaving the player therefore let the current audio chunk
+finish first (at most about one second), then playback resumes in sync at a
+chunk boundary.

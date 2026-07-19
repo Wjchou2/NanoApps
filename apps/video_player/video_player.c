@@ -1,10 +1,13 @@
 /*
- * video_player — streamed silent-video playback for NanoApps.
+ * video_player — streamed video + chunked WAV playback for NanoApps.
  *
  * The retail OS/SDK does not expose an arbitrary MP4/H.264 decoder to a
  * homebrew surface. Videos are converted on the host with tools/make_hbv.py
  * into .hbv files: RGB565 frames compressed as delta COPY/SKIP runs. The app
  * reads one compressed frame at a time, so file length is not limited by RAM.
+ * A matching <name>.audio directory may contain meta.hba plus numbered WAV
+ * chunks. Short chunks let pause/back take effect without needing an unknown
+ * firmware stop/seek call; playback re-synchronizes at every chunk boundary.
  *
  * Files: .hbv entries inside /Apps/Data/Videos
  * Format (little-endian):
@@ -29,6 +32,8 @@
 #define MAX_VIDEO_W       240u
 #define MAX_VIDEO_H       320u
 #define MAX_PACKET        (384u * 1024u)
+#define HBA_HEADER        32u
+#define MAX_AUDIO_CHUNKS  10000u
 
 #define HEADER_H          40
 #define STAGE_H           320
@@ -38,6 +43,7 @@
 typedef struct {
     char name[MAX_NAME];
     uint32_t size;
+    bool has_audio;
 } video_t;
 
 typedef struct {
@@ -67,6 +73,14 @@ static uint32_t s_last_hud_ms;
 static bool s_playing;
 static bool s_loop = true;
 static bool s_stream_open;
+static char s_audio_dir[192];
+static uint32_t s_audio_chunk_ms;
+static uint32_t s_audio_chunks;
+static uint32_t s_audio_next;
+static uint32_t s_audio_total_ms;
+static uint32_t s_audio_active_until;
+static bool s_has_audio;
+static bool s_restart_pending;
 
 /* ---------------------------------------------------------------- strings -- */
 
@@ -105,6 +119,25 @@ static void path_for(char *out, const char *name)
     const char *p = DATA_DIR "/";
     while (*p && k < 158) out[k++] = *p++;
     for (int i = 0; name[i] && k < 158; i++) out[k++] = name[i];
+    out[k] = 0;
+}
+
+static void audio_dir_for(char *out, const char *name)
+{
+    path_for(out, name);
+    int n = s_len(out);
+    if (n >= 4 && out[n - 4] == '.') {
+        out[n - 3] = 'a'; out[n - 2] = 'u'; out[n - 1] = 'd';
+        out[n++] = 'i'; out[n++] = 'o'; out[n] = 0;
+    }
+}
+
+static void audio_meta_for(char *out, const char *name)
+{
+    audio_dir_for(out, name);
+    int k = s_len(out);
+    const char *tail = "/meta.hba";
+    while (*tail && k < 190) out[k++] = *tail++;
     out[k] = 0;
 }
 
@@ -164,6 +197,8 @@ static void scan_videos(void)
         s_copy(s_videos[s_n_videos].name, name, MAX_NAME);
         char path[160]; path_for(path, name);
         s_videos[s_n_videos].size = hb_fs_size(path);
+        char meta[192]; audio_meta_for(meta, name);
+        s_videos[s_n_videos].has_audio = hb_fs_exists(meta);
         s_n_videos++;
     }
     hb_fs_dir_close(&d);
@@ -175,6 +210,45 @@ static void scan_videos(void)
         }
         s_videos[j] = cur;
     }
+}
+
+static bool open_audio_meta(const char *name)
+{
+    uint8_t raw[HBA_HEADER];
+    char meta[192];
+    audio_meta_for(meta, name);
+    s_has_audio = false;
+    s_audio_chunk_ms = s_audio_chunks = s_audio_next = 0;
+    s_audio_total_ms = 0;
+    if (hb_fs_read(meta, raw, sizeof raw) != sizeof raw) return false;
+    if (raw[0] != 'H' || raw[1] != 'B' || raw[2] != 'A' ||
+        raw[3] != 'U' || raw[4] != 'D' || raw[5] != '1') return false;
+    uint32_t chunk_ms = rd32(raw + 8);
+    uint32_t chunks = rd32(raw + 12);
+    uint32_t total_ms = rd32(raw + 16);
+    uint32_t channels = rd32(raw + 24);
+    uint32_t bits = rd32(raw + 28);
+    if (chunk_ms < 250u || chunk_ms > 10000u || chunks == 0 || total_ms == 0 ||
+        chunks > MAX_AUDIO_CHUNKS || channels != 1u || bits != 16u) return false;
+    audio_dir_for(s_audio_dir, name);
+    s_audio_chunk_ms = chunk_ms;
+    s_audio_chunks = chunks;
+    s_audio_total_ms = total_ms;
+    s_has_audio = true;
+    return true;
+}
+
+static void audio_chunk_path(char out[224], uint32_t chunk)
+{
+    int k = 0;
+    while (s_audio_dir[k] && k < 200) { out[k] = s_audio_dir[k]; k++; }
+    out[k++] = '/';
+    uint32_t div = 10000u;
+    while (div) {
+        out[k++] = (char)('0' + (chunk / div) % 10u);
+        div /= 10u;
+    }
+    out[k++] = '.'; out[k++] = 'w'; out[k++] = 'a'; out[k++] = 'v'; out[k] = 0;
 }
 
 static uint32_t stream_read_exact(void *buf, uint32_t len)
@@ -311,6 +385,46 @@ static void playback_error(void)
     if (s_status_label) lv_label_set_text(s_status_label, "Playback error");
 }
 
+static bool audio_active(uint32_t now)
+{
+    return s_has_audio && (int32_t)(now - s_audio_active_until) < 0;
+}
+
+static uint32_t audio_chunk_duration(uint32_t chunk)
+{
+    uint32_t start = chunk * s_audio_chunk_ms;
+    if (start >= s_audio_total_ms) return s_audio_chunk_ms;
+    uint32_t left = s_audio_total_ms - start;
+    return left < s_audio_chunk_ms ? left : s_audio_chunk_ms;
+}
+
+static void try_start_audio(uint32_t now)
+{
+    if (!s_has_audio || !s_playing || s_audio_next >= s_audio_chunks ||
+        audio_active(now)) return;
+
+    uint32_t video_ms = s_frame > 0 ? (s_frame - 1u) * s_hdr.frame_ms : 0;
+    uint32_t wanted = video_ms / s_audio_chunk_ms;
+    if (wanted > s_audio_next) s_audio_next = wanted; /* re-sync after a stall */
+    if (s_audio_next >= s_audio_chunks ||
+        video_ms < s_audio_next * s_audio_chunk_ms) return;
+
+    char path[224];
+    uint32_t chunk = s_audio_next;
+    audio_chunk_path(path, chunk);
+    if (hb_audio_play_wav_main(path, 0x7000u)) {
+        s_audio_next++;
+        s_audio_active_until = now + audio_chunk_duration(chunk);
+        if (s_status_label) {
+            lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x30d158), 0);
+            lv_label_set_text(s_status_label, "Audio");
+        }
+    } else if (s_status_label) {
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xff453a), 0);
+        lv_label_set_text(s_status_label, "Audio start failed");
+    }
+}
+
 static void set_playing(bool on)
 {
     if (on && s_frame >= s_hdr.frames) {
@@ -323,17 +437,54 @@ static void set_playing(bool on)
     update_play_icon();
 }
 
+static bool restart_now(void)
+{
+    if (!rewind_stream() || decode_next() != 1) {
+        playback_error(); return false;
+    }
+    s_audio_next = 0;
+    s_audio_active_until = 0;
+    s_restart_pending = false;
+    if (s_canvas) lv_obj_invalidate(s_canvas);
+    update_hud();
+    set_playing(true);
+    try_start_audio(lv_tick_get());
+    return true;
+}
+
+static void request_restart(void)
+{
+    uint32_t now = lv_tick_get();
+    if (audio_active(now)) {
+        s_restart_pending = true;
+        s_playing = false;
+        hb_wake_lock(true);
+        update_play_icon();
+        if (s_status_label) {
+            lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x9aa5b1), 0);
+            lv_label_set_text(s_status_label, "Restarting after audio chunk");
+        }
+        return;
+    }
+    restart_now();
+}
+
 static void player_frame(void)
 {
-    if (!s_playing || !s_canvas) return;
     uint32_t now = lv_tick_get();
+    if (s_restart_pending) {
+        if (!audio_active(now)) restart_now();
+        return;
+    }
+    if (!s_playing || !s_canvas) return;
+    try_start_audio(now);
     if ((int32_t)(now - s_next_ms) < 0) return;
 
     int rc = decode_next();
     if (rc == 0) {
         if (!s_loop) { set_playing(false); update_hud(); return; }
-        if (!rewind_stream()) { playback_error(); return; }
-        rc = decode_next();
+        request_restart();
+        return;
     }
     if (rc != 1) { playback_error(); return; }
 
@@ -343,20 +494,31 @@ static void player_frame(void)
     if (now - s_last_hud_ms >= 250u || s_frame == s_hdr.frames) {
         update_hud(); s_last_hud_ms = now;
     }
+    try_start_audio(now);
 }
 
 static void toggle_cb(lv_event_t *e)
 {
-    (void)e; set_playing(!s_playing);
+    (void)e;
+    if (s_restart_pending) return;
+    bool on = !s_playing;
+    if (on && s_frame >= s_hdr.frames) {
+        request_restart();
+        return;
+    }
+    set_playing(on);
+    if (on) {
+        try_start_audio(lv_tick_get());
+    } else if (s_has_audio && audio_active(lv_tick_get()) && s_status_label) {
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x9aa5b1), 0);
+        lv_label_set_text(s_status_label, "Pausing after audio chunk");
+    }
 }
 
 static void restart_cb(lv_event_t *e)
 {
     (void)e;
-    if (!rewind_stream() || decode_next() != 1) { playback_error(); return; }
-    lv_obj_invalidate(s_canvas);
-    update_hud();
-    set_playing(true);
+    request_restart();
 }
 
 static void loop_cb(lv_event_t *e)
@@ -375,6 +537,10 @@ static void player_free(void)
     s_canvas = 0; s_play_icon = 0; s_loop_label = 0;
     s_progress = 0; s_time_label = 0; s_status_label = 0;
     s_playing = false;
+    s_restart_pending = false;
+    s_has_audio = false;
+    s_audio_next = s_audio_chunks = s_audio_chunk_ms = 0;
+    s_audio_total_ms = 0;
 }
 
 static void build_library(void);
@@ -419,6 +585,7 @@ static void build_player(int idx)
     if (s_library) { lv_obj_delete(s_library); s_library = 0; }
     path_for(s_path, s_videos[idx].name);
     display_name(title, s_videos[idx].name, sizeof title);
+    open_audio_meta(s_videos[idx].name);
 
     if (!open_stream_header(s_path, &s_hdr)) {
         show_player_error("This is not a valid HBVID1 video."); return;
@@ -480,8 +647,9 @@ static void build_player(int idx)
     lv_label_set_text(s_loop_label, s_loop ? "Loop on" : "Loop off"); lv_obj_center(s_loop_label);
 
     s_status_label = lv_label_create(stage);
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xff453a), 0);
-    lv_label_set_text(s_status_label, "");
+    lv_obj_set_style_text_color(s_status_label,
+        lv_color_hex(s_has_audio ? 0x30d158 : 0x9aa5b1), 0);
+    lv_label_set_text(s_status_label, s_has_audio ? "Audio" : "Silent");
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     if (decode_next() != 1) { playback_error(); return; }
@@ -489,7 +657,21 @@ static void build_player(int idx)
     update_hud();
     s_last_hud_ms = lv_tick_get();
     hb_lv_set_frame_cb(player_frame);
-    set_playing(true);
+    uint32_t now = lv_tick_get();
+    if (s_has_audio && audio_active(now)) {
+        /* A chunk from the previous player can outlive Back by less than a
+           second. Hold the new video at frame zero instead of overlapping or
+           starting it late, then restart cleanly when that chunk expires. */
+        s_restart_pending = true;
+        s_playing = false;
+        hb_wake_lock(true);
+        update_play_icon();
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x9aa5b1), 0);
+        lv_label_set_text(s_status_label, "Waiting for audio");
+    } else {
+        set_playing(true);
+        try_start_audio(now);
+    }
 }
 
 /* ---------------------------------------------------------------- library -- */
@@ -535,7 +717,7 @@ static void build_library(void)
         lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(empty, lv_color_hex(0x9aa5b1), 0);
-        lv_label_set_text(empty, "No videos\n\nConvert with tools/make_hbv.py, then copy .hbv files to /Apps/Data/Videos");
+        lv_label_set_text(empty, "No videos\n\nConvert with tools/make_hbv.py, then copy .hbv + .audio to /Apps/Data/Videos");
         lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
         return;
     }
@@ -567,6 +749,12 @@ static void build_library(void)
         lv_label_set_text(name, title_text);
 
         char size[24]; format_size(s_videos[i].size, size);
+        if (s_videos[i].has_audio) {
+            int k = s_len(size);
+            const char *tag = " + audio";
+            while (*tag && k < 23) size[k++] = *tag++;
+            size[k] = 0;
+        }
         lv_obj_t *sz = lv_label_create(row);
         lv_obj_set_pos(sz, 30, 25); lv_obj_set_width(sz, 142);
         lv_obj_set_style_text_font(sz, &lv_font_montserrat_14, 0);

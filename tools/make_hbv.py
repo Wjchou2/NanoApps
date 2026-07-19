@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Convert a video to NanoApps' streamed HBVID1 format.
+"""Convert a video to NanoApps' streamed HBVID1 video + WAV-chunk audio.
 
 Usage:
   tools/make_hbv.py movie.mp4 movie.hbv
   tools/make_hbv.py movie.mp4 movie.hbv --fps 15
   tools/make_hbv.py --demo demo.hbv
 
-The converter uses ffmpeg for normal input. Output is silent RGB565 video,
-letterboxed to at most 240x320, with delta COPY/SKIP compression and periodic
-keyframes. Copy the result to /Apps/Data/Videos on the iPod.
+The converter uses ffmpeg for normal input. Video is RGB565, letterboxed to at
+most 240x320, with delta COPY/SKIP compression and periodic keyframes. If the
+input has audio, a matching ``<name>.audio`` directory is written beside the
+.hbv file. Copy both outputs to /Apps/Data/Videos on the iPod.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,14 +23,19 @@ import struct
 import subprocess
 import sys
 import tempfile
+import wave
 from typing import Iterable, Iterator
 
 MAGIC = b"HBVID1\0\0"
 HEADER = struct.Struct("<8sIIIIII")
+AUDIO_MAGIC = b"HBAUD1\0\0"
+AUDIO_HEADER = struct.Struct("<8sIIIIII")
 WIDTH = 240
 HEIGHT = 320
 MAX_FPS = 30
 MAX_TOKEN = 0x7FFF
+AUDIO_RATE = 22050
+AUDIO_CHUNK_MS = 1000
 
 
 def read_exact(pipe, size: int) -> bytes:
@@ -77,6 +84,137 @@ def ffmpeg_frames(source: Path, fps: int, width: int, height: int) -> Iterator[b
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def audio_dir_for(output: Path) -> Path:
+    return output.with_suffix(".audio")
+
+
+def source_has_audio(source: Path) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required (it is installed with ffmpeg)")
+    result = subprocess.run([
+        ffprobe, "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=index", "-of", "csv=p=0", str(source),
+    ], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "ffprobe could not inspect the input")
+    return bool(result.stdout.strip())
+
+
+def write_wav(path: Path, pcm: bytes, sample_rate: int = AUDIO_RATE) -> None:
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+
+
+def install_audio_dir(staging: Path, output: Path, chunk_ms: int,
+                      chunks: int, total_samples: int,
+                      sample_rate: int = AUDIO_RATE) -> None:
+    total_ms = max(1, (total_samples * 1000 + sample_rate // 2) // sample_rate)
+    (staging / "meta.hba").write_bytes(AUDIO_HEADER.pack(
+        AUDIO_MAGIC, chunk_ms, chunks, total_ms, sample_rate, 1, 16))
+    remove_stale_audio(output)
+    os.replace(staging, output)
+
+
+def remove_stale_audio(output: Path) -> None:
+    if not output.exists():
+        return
+    meta = output / "meta.hba" if output.is_dir() else None
+    if meta is None or not meta.is_file():
+        raise RuntimeError(f"refusing to replace unmanaged audio path: {output}")
+    with meta.open("rb") as fp:
+        if fp.read(8) != AUDIO_MAGIC:
+            raise RuntimeError(f"refusing to replace unmanaged audio path: {output}")
+    shutil.rmtree(output)
+
+
+def write_source_audio(source: Path, output: Path, video_ms: int,
+                       chunk_ms: int) -> tuple[int, int]:
+    """Extract mono PCM and store it as independently playable WAV chunks."""
+    if not source_has_audio(source):
+        remove_stale_audio(output)
+        return 0, 0
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required (macOS: brew install ffmpeg)")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=output.name + ".", dir=output.parent))
+    samples_per_chunk = max(1, AUDIO_RATE * chunk_ms // 1000)
+    bytes_per_chunk = samples_per_chunk * 2
+    duration = f"{video_ms / 1000.0:.3f}"
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(source),
+        "-map", "0:a:0", "-vn", "-sn", "-dn", "-t", duration,
+        "-ac", "1", "-ar", str(AUDIO_RATE), "-c:a", "pcm_s16le",
+        "-f", "s16le", "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None and proc.stderr is not None
+    chunks = 0
+    total_samples = 0
+    try:
+        while True:
+            pcm = read_exact(proc.stdout, bytes_per_chunk)
+            if not pcm:
+                break
+            if len(pcm) & 1:
+                pcm = pcm[:-1]
+            if not pcm:
+                break
+            write_wav(staging / f"{chunks:05d}.wav", pcm)
+            total_samples += len(pcm) // 2
+            chunks += 1
+        error = proc.stderr.read().decode("utf-8", "replace").strip()
+        status = proc.wait()
+        if status:
+            raise RuntimeError(error or f"ffmpeg audio extraction exited with status {status}")
+        if chunks == 0:
+            shutil.rmtree(staging)
+            remove_stale_audio(output)
+            return 0, 0
+        install_audio_dir(staging, output, chunk_ms, chunks, total_samples)
+        return chunks, total_samples
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+
+def write_demo_audio(output: Path, duration_ms: int,
+                     chunk_ms: int) -> tuple[int, int]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=output.name + ".", dir=output.parent))
+    total_samples = AUDIO_RATE * duration_ms // 1000
+    samples_per_chunk = max(1, AUDIO_RATE * chunk_ms // 1000)
+    chunks = 0
+    try:
+        for start in range(0, total_samples, samples_per_chunk):
+            count = min(samples_per_chunk, total_samples - start)
+            pcm = bytearray(count * 2)
+            for i in range(count):
+                t = (start + i) / AUDIO_RATE
+                beat = int(t * 4.0) % 8
+                frequency = (262, 330, 392, 523)[(beat // 2) % 4]
+                envelope = min(1.0, (t * 4.0) % 1.0 * 8.0) * 0.22
+                sample = int(32767 * envelope * math.sin(2.0 * math.pi * frequency * t))
+                struct.pack_into("<h", pcm, i * 2, sample)
+            write_wav(staging / f"{chunks:05d}.wav", bytes(pcm))
+            chunks += 1
+        install_audio_dir(staging, output, chunk_ms, chunks, total_samples)
+        return chunks, total_samples
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
 
 
 def rgb565(r: int, g: int, b: int) -> bytes:
@@ -202,6 +340,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--height", type=int, default=HEIGHT, help="frame height (max: 320)")
     parser.add_argument("--key-seconds", type=int, default=5,
                         help="keyframe interval in seconds (default: 5)")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="do not extract a soundtrack")
+    parser.add_argument("--audio-chunk-ms", type=int, default=AUDIO_CHUNK_MS,
+                        help="WAV chunk length in milliseconds (default: 1000)")
     args = parser.parse_args(argv)
 
     if not 1 <= args.fps <= MAX_FPS:
@@ -210,6 +352,8 @@ def main(argv: list[str]) -> int:
         parser.error(f"dimensions must fit within {WIDTH}x{HEIGHT}")
     if args.key_seconds < 1:
         parser.error("--key-seconds must be positive")
+    if not 500 <= args.audio_chunk_ms <= 5000:
+        parser.error("--audio-chunk-ms must be between 500 and 5000")
 
     if args.demo:
         if len(args.paths) != 1:
@@ -227,13 +371,29 @@ def main(argv: list[str]) -> int:
     try:
         count, frame_ms, size = write_hbv(output, frames, args.width, args.height,
                                           args.fps, args.key_seconds)
+        video_ms = count * frame_ms
+        audio_dir = audio_dir_for(output)
+        if args.no_audio:
+            remove_stale_audio(audio_dir)
+            audio_chunks = audio_samples = 0
+        elif args.demo:
+            audio_chunks, audio_samples = write_demo_audio(
+                audio_dir, video_ms, args.audio_chunk_ms)
+        else:
+            audio_chunks, audio_samples = write_source_audio(
+                source, audio_dir, video_ms, args.audio_chunk_ms)
     except (OSError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     seconds = count * frame_ms / 1000.0
+    if audio_chunks:
+        audio_seconds = audio_samples / AUDIO_RATE
+        audio = f", audio {audio_seconds:.1f}s in {audio_chunks} WAV chunks"
+    else:
+        audio = ", silent"
     print(f"wrote {output}: {args.width}x{args.height}, {count} frames, "
-          f"{seconds:.1f}s, {size / (1024 * 1024):.2f} MiB, silent")
+          f"{seconds:.1f}s, {size / (1024 * 1024):.2f} MiB{audio}")
     return 0
 
 
