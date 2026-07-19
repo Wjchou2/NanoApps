@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Build the homebrew /Apps image for the relocatable LVGL surface model.
 
-The staging tree under /tmp/hbapps mirrors the device 1:1 (it IS the /Apps
-image), so install is a plain recursive copy. Apps are ordered alphabetically by
-CFBundleName — the pack order, icon-id assignment and the k-th icon file all
-follow it, so the on-disk order is derivable from the names alone.
+The per-user staging tree under the system temporary directory mirrors the
+device 1:1 (it IS the /Apps image), so install is a plain recursive copy. Apps
+are ordered alphabetically by CFBundleName — the pack order, icon-id assignment
+and the k-th icon file all follow it, so the on-disk order is derivable from the
+names alone.
 
 For every app that builds (apps/<name>/build/<name>.hbapp):
   - generate a 112x112 home icon (glossy 90x90 color disc + white FontAwesome
-    glyph, OS-sampled palette) -> /tmp/hbapps/Apps/Icons/<CFBundleName>.bin,
-  - copy the relocatable blob -> /tmp/hbapps/Apps/Executables/<CFBundleName>.hbapp,
+    glyph, OS-sampled palette) -> <stage>/Apps/Icons/<CFBundleName>.bin,
+  - copy the relocatable blob -> <stage>/Apps/Executables/<CFBundleName>.hbapp,
   - make a bundle (label + a SHARED custom screen; NO icon/code section — those
     are separate disk files) and pack them all into Apps/AllApps.pack.
 
@@ -271,13 +272,24 @@ def main(apps):
     # so the dim/no-dim screens always match the committed source.
     if (ROOT / "tools" / "screens").is_dir():
         build_screens()
-    # Clean slate. The staging tree under /tmp/hbapps mirrors the device 1:1 — it
+    # Clean slate. A per-user path prevents an old root-owned staging directory
+    # (for example, from running start with sudo) from breaking later normal runs.
+    # NANOAPPS_STAGE lets the launcher pass the exact same path explicitly.
+    # The staging tree mirrors the device 1:1 — it
     # IS the /Apps image (AllApps.pack + Executables/ + Icons/), so install is a
     # plain recursive copy, no rename/remap. Build scratch (intermediate .app
     # bundles, icon db) lives in a SEPARATE dir so it never ships.
     import shutil as _sh, tempfile
-    out = Path("/tmp/hbapps")
-    _sh.rmtree(out, ignore_errors=True)
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    out = Path(os.environ.get(
+        "NANOAPPS_STAGE", Path(tempfile.gettempdir()) / f"nanoapps-hbapps-{uid}"))
+    try:
+        _sh.rmtree(out)
+    except FileNotFoundError:
+        pass
+    except PermissionError as exc:
+        sys.exit(f"cannot clean staging directory {out}: {exc}\n"
+                 "Remove that directory once as its owner, then rerun ./start.")
     appsd  = out / "Apps"            # == device /Apps
     execd  = appsd / "Executables"  # == device /Apps/Executables/<CFBundleName>.hbapp
     iconsd = appsd / "Icons"        # == device /Apps/Icons/<CFBundleName>.bin

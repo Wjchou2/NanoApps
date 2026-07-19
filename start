@@ -68,6 +68,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent   # the repo root (this script lives there)
 TRACE_RING = 0x09120000
 TRACE_MAGIC = 0x48425452  # 'RTBH'
+# Keep generated install payloads separate for each host user. A shared
+# /tmp/hbapps can be left root-owned by an earlier sudo run, which makes the next
+# normal resident-only repack fail with PermissionError.
+STAGE_ROOT = Path(tempfile.gettempdir()) / f"nanoapps-hbapps-{os.getuid()}"
 
 # Per-user transport config (NO hardcoded host). First device op prompts for
 # the setup and persists it here; `start setup` re-runs the prompt.
@@ -890,6 +894,16 @@ def _push_run(tr, name):
 
 
 # ---- disk install ------------------------------------------------------------
+def _device_stage_root(tr):
+    """Return the per-user staging path on the iPod's Linux host."""
+    if tr.mode == "local":
+        return str(STAGE_ROOT)
+    remote = tr.sh("printf '/tmp/nanoapps-hbapps-%s' \"$(id -u)\"", capture=True).strip()
+    if not remote.startswith("/tmp/nanoapps-hbapps-"):
+        sys.exit("could not determine a safe staging directory on the remote iPod host")
+    return remote
+
+
 def _mount_prep(dev, part, fstype, mnt):
     """Return Bash that mounts a detected FAT or HFS+ data volume read-write.
 
@@ -931,7 +945,7 @@ def _install_disk(tr, src, data, data_force):
     """Mount the iPod's data partition and write the staged /Apps tree. Preserves
     /Apps/Data; sweeps retired layouts. Never DRAM-stages (that white-screens the
     live OS)."""
-    stage = "/tmp/hbapps"
+    stage = _device_stage_root(tr)
     tr.stage(f"{src}/Apps", f"{stage}/Apps")
     if (data or data_force) and (ROOT / "data").is_dir():
         tr.stage(str(ROOT / "data"), f"{stage}/data")
@@ -993,12 +1007,15 @@ def _deploy_apps(tr, names, data, data_force, resident_only):
             sys.exit(f"!! named target(s) failed: {', '.join(failed)}")
 
     print("==> [3/5] pack")
-    subprocess.run(["python3", str(ROOT / "tools" / "build_apps.py")], check=True)
+    pack_env = os.environ.copy()
+    pack_env["NANOAPPS_STAGE"] = str(STAGE_ROOT)
+    subprocess.run(["python3", str(ROOT / "tools" / "build_apps.py")],
+                   check=True, env=pack_env)
 
     print("==> [4/5] install to iPod disk")
     if data_force:   print("    (seeding data/ -> /Apps/Data, OVERWRITING existing)")
     elif data:       print("    (seeding data/ -> /Apps/Data, keeping existing)")
-    _install_disk(tr, "/tmp/hbapps", data, data_force)
+    _install_disk(tr, str(STAGE_ROOT), data, data_force)
 
     # install_disk only writes files; nothing on the home screen changes until the
     # resident is re-exec'd to register the icons + on-tap loader.
